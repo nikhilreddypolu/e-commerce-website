@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.env
+.flaskenv
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~
