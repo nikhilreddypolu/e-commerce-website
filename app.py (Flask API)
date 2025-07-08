@@ -1,0 +1,427 @@
+import os
+import uuid
+import datetime
+import jwt
+from flask import Flask, request, jsonify
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_cors import CORS # Import CORS
+
+app = Flask(__name__)
+CORS(app) # Enable CORS for all routes
+
+# --- Configuration ---
+# Generate a random secret key for JWTs
+app.config['SECRET_KEY'] = os.urandom(24).hex()
+app.config['JWT_EXPIRATION_DAYS'] = 7 # JWTs expire after 7 days
+
+# --- In-memory Data Stores (for demonstration purposes) ---
+# In a real application, these would be stored in a database (e.g., SQL, NoSQL)
+users = {} # user_id: {username, password_hash, role}
+products = {} # product_id: {name, description, price, stock}
+carts = {} # user_id: {product_id: quantity}
+orders = {} # order_id: {user_id, items: [{product_id, quantity, price, name}], total, status, created_at}
+
+# --- Helper Functions ---
+
+def generate_jwt(user_id, role):
+    """Generates a JWT token for the given user_id and role."""
+    payload = {
+        'user_id': user_id,
+        'role': role,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=app.config['JWT_EXPIRATION_DAYS']),
+        'iat': datetime.datetime.utcnow()
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+
+def decode_jwt(token):
+    """Decodes a JWT token and returns the payload, or None if invalid."""
+    try:
+        return jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+    except jwt.ExpiredSignatureError:
+        return {'error': 'Token has expired'}
+    except jwt.InvalidTokenError:
+        return {'error': 'Invalid token'}
+
+# --- Decorators for Authentication and Authorization ---
+
+def jwt_required(f):
+    """Decorator to ensure a valid JWT is provided in the Authorization header."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(" ")[1] # Bearer <token>
+
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+
+        payload = decode_jwt(token)
+        if 'error' in payload:
+            return jsonify({'message': payload['error']}), 401
+
+        request.user_id = payload['user_id']
+        request.user_role = payload['role']
+        return f(*args, **kwargs)
+    return decorated_function
+
+def roles_required(roles):
+    """Decorator to ensure the authenticated user has one of the required roles."""
+    def decorator(f):
+        @wraps(f)
+        @jwt_required
+        def decorated_function(*args, **kwargs):
+            if request.user_role not in roles:
+                return jsonify({'message': 'Access forbidden: Insufficient permissions'}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+# --- API Endpoints ---
+
+@app.route('/')
+def home():
+    """Home route for basic API status check."""
+    return jsonify({'message': 'E-commerce API is running!'})
+
+@app.route('/register', methods=['POST'])
+def register_user():
+    """Registers a new user with 'customer' role by default."""
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({'message': 'Username and password are required'}), 400
+
+    if any(u['username'] == username for u in users.values()):
+        return jsonify({'message': 'Username already exists'}), 409
+
+    user_id = str(uuid.uuid4())
+    users[user_id] = {
+        'username': username,
+        'password_hash': generate_password_hash(password),
+        'role': 'customer' # Default role for new registrations
+    }
+    return jsonify({'message': 'User registered successfully', 'user_id': user_id}), 201
+
+@app.route('/login', methods=['POST'])
+def login_user():
+    """Authenticates a user and returns a JWT."""
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({'message': 'Username and password are required'}), 400
+
+    user_found = None
+    user_id = None
+    for uid, user_data in users.items():
+        if user_data['username'] == username:
+            user_found = user_data
+            user_id = uid
+            break
+
+    if not user_found or not check_password_hash(user_found['password_hash'], password):
+        return jsonify({'message': 'Invalid credentials'}), 401
+
+    token = generate_jwt(user_id, user_found['role'])
+    return jsonify({'message': 'Login successful', 'token': token, 'role': user_found['role'], 'user_id': user_id}), 200
+
+# --- Product Endpoints ---
+
+@app.route('/products', methods=['GET'])
+@jwt_required
+def get_products():
+    """Fetches a list of all available products."""
+    products_list = []
+    for product_id, product_data in products.items():
+        products_list.append({'id': product_id, **product_data})
+    return jsonify(products_list), 200
+
+@app.route('/products', methods=['POST'])
+@roles_required(['admin'])
+def add_product():
+    """Adds a new product (Admin only)."""
+    data = request.get_json()
+    name = data.get('name')
+    description = data.get('description', '')
+    price = data.get('price')
+    stock = data.get('stock', 0)
+
+    if not name or price is None:
+        return jsonify({'message': 'Product name and price are required'}), 400
+    if not isinstance(price, (int, float)) or price < 0:
+        return jsonify({'message': 'Price must be a non-negative number'}), 400
+    if not isinstance(stock, int) or stock < 0:
+        return jsonify({'message': 'Stock must be a non-negative integer'}), 400
+
+    product_id = str(uuid.uuid4())
+    products[product_id] = {
+        'name': name,
+        'description': description,
+        'price': float(price),
+        'stock': int(stock)
+    }
+    return jsonify({'message': 'Product added successfully', 'product': {'id': product_id, **products[product_id]}}), 201
+
+@app.route('/products/<product_id>', methods=['PUT'])
+@roles_required(['admin'])
+def update_product(product_id):
+    """Updates an existing product (Admin only)."""
+    if product_id not in products:
+        return jsonify({'message': 'Product not found'}), 404
+
+    data = request.get_json()
+    name = data.get('name', products[product_id]['name'])
+    description = data.get('description', products[product_id]['description'])
+    price = data.get('price', products[product_id]['price'])
+    stock = data.get('stock', products[product_id]['stock'])
+
+    if not isinstance(price, (int, float)) or price < 0:
+        return jsonify({'message': 'Price must be a non-negative number'}), 400
+    if not isinstance(stock, int) or stock < 0:
+        return jsonify({'message': 'Stock must be a non-negative integer'}), 400
+
+    products[product_id].update({
+        'name': name,
+        'description': description,
+        'price': float(price),
+        'stock': int(stock)
+    })
+    return jsonify({'message': 'Product updated successfully', 'product': {'id': product_id, **products[product_id]}}), 200
+
+@app.route('/products/<product_id>', methods=['DELETE'])
+@roles_required(['admin'])
+def delete_product(product_id):
+    """Deletes a product (Admin only)."""
+    if product_id not in products:
+        return jsonify({'message': 'Product not found'}), 404
+
+    del products[product_id]
+    return jsonify({'message': 'Product deleted successfully'}), 200
+
+# --- Cart Endpoints (Customer only) ---
+
+@app.route('/cart', methods=['GET'])
+@roles_required(['customer'])
+def get_cart():
+    """Retrieves the current user's cart."""
+    user_id = request.user_id
+    user_cart = carts.get(user_id, {})
+    cart_items_details = []
+    for product_id, quantity in user_cart.items():
+        product = products.get(product_id)
+        if product:
+            cart_items_details.append({
+                'product_id': product_id,
+                'name': product['name'],
+                'price': product['price'],
+                'quantity': quantity
+            })
+    return jsonify(cart_items_details), 200
+
+@app.route('/cart/add', methods=['POST'])
+@roles_required(['customer'])
+def add_to_cart():
+    """Adds a product to the current user's cart."""
+    user_id = request.user_id
+    data = request.get_json()
+    product_id = data.get('product_id')
+    quantity = data.get('quantity', 1)
+
+    if not product_id or not isinstance(quantity, int) or quantity <= 0:
+        return jsonify({'message': 'Invalid product ID or quantity'}), 400
+
+    if product_id not in products:
+        return jsonify({'message': 'Product not found'}), 404
+
+    product = products[product_id]
+    if product['stock'] < quantity:
+        return jsonify({'message': f'Not enough stock for {product["name"]}. Available: {product["stock"]}'}), 400
+
+    user_cart = carts.setdefault(user_id, {})
+    user_cart[product_id] = user_cart.get(product_id, 0) + quantity
+    return jsonify({'message': 'Product added to cart', 'cart': user_cart}), 200
+
+@app.route('/cart/update', methods=['PUT'])
+@roles_required(['customer'])
+def update_cart_item():
+    """Updates the quantity of a product in the current user's cart."""
+    user_id = request.user_id
+    data = request.get_json()
+    product_id = data.get('product_id')
+    new_quantity = data.get('quantity')
+
+    if not product_id or not isinstance(new_quantity, int) or new_quantity < 0:
+        return jsonify({'message': 'Invalid product ID or quantity'}), 400
+
+    user_cart = carts.get(user_id, {})
+    if product_id not in user_cart:
+        return jsonify({'message': 'Product not in cart'}), 404
+
+    if new_quantity == 0:
+        del user_cart[product_id]
+        if not user_cart: # If cart becomes empty, remove user's cart entry
+            del carts[user_id]
+        return jsonify({'message': 'Product removed from cart', 'cart': user_cart}), 200
+
+    product = products.get(product_id)
+    if not product:
+        return jsonify({'message': 'Product not found'}), 404 # Should not happen if product was in cart
+
+    if product['stock'] < new_quantity:
+        return jsonify({'message': f'Not enough stock for {product["name"]}. Available: {product["stock"]}'}), 400
+
+    user_cart[product_id] = new_quantity
+    return jsonify({'message': 'Cart updated successfully', 'cart': user_cart}), 200
+
+@app.route('/cart/remove/<product_id>', methods=['DELETE'])
+@roles_required(['customer'])
+def remove_from_cart(product_id):
+    """Removes a product from the current user's cart."""
+    user_id = request.user_id
+    user_cart = carts.get(user_id, {})
+
+    if product_id not in user_cart:
+        return jsonify({'message': 'Product not in cart'}), 404
+
+    del user_cart[product_id]
+    if not user_cart: # If cart becomes empty, remove user's cart entry
+        del carts[user_id]
+    return jsonify({'message': 'Product removed from cart', 'cart': user_cart}), 200
+
+# --- Order Endpoints ---
+
+@app.route('/orders', methods=['POST'])
+@roles_required(['customer'])
+def create_order():
+    """Creates an order from the current user's cart."""
+    user_id = request.user_id
+    user_cart = carts.get(user_id, {})
+
+    if not user_cart:
+        return jsonify({'message': 'Your cart is empty'}), 400
+
+    order_items = []
+    total_amount = 0
+
+    # Validate stock and prepare order items
+    for product_id, quantity in user_cart.items():
+        product = products.get(product_id)
+        if not product:
+            return jsonify({'message': f'Product with ID {product_id} not found. Cannot create order.'}), 404
+        if product['stock'] < quantity:
+            return jsonify({'message': f'Not enough stock for {product["name"]}. Available: {product["stock"]}'}), 400
+
+        order_items.append({
+            'product_id': product_id,
+            'name': product['name'],
+            'price': product['price'],
+            'quantity': quantity
+        })
+        total_amount += product['price'] * quantity
+
+    # Deduct stock
+    for item in order_items:
+        products[item['product_id']]['stock'] -= item['quantity']
+
+    order_id = str(uuid.uuid4())
+    orders[order_id] = {
+        'user_id': user_id,
+        'items': order_items,
+        'total': total_amount,
+        'status': 'Pending', # Initial status
+        'created_at': datetime.datetime.utcnow().isoformat()
+    }
+
+    # Clear user's cart after order creation
+    del carts[user_id]
+
+    return jsonify({'message': 'Order created successfully', 'order_id': order_id, 'order': orders[order_id]}), 201
+
+@app.route('/orders', methods=['GET'])
+@roles_required(['admin'])
+def get_all_orders():
+    """Retrieves all orders (Admin only)."""
+    orders_list = []
+    for order_id, order_data in orders.items():
+        orders_list.append({'id': order_id, **order_data})
+    return jsonify(orders_list), 200
+
+@app.route('/orders/my', methods=['GET'])
+@roles_required(['customer'])
+def get_my_orders():
+    """Retrieves orders placed by the current customer."""
+    user_id = request.user_id
+    my_orders = []
+    for order_id, order_data in orders.items():
+        if order_data['user_id'] == user_id:
+            my_orders.append({'id': order_id, **order_data})
+    return jsonify(my_orders), 200
+
+@app.route('/orders/<order_id>/status', methods=['PUT'])
+@roles_required(['admin'])
+def update_order_status(order_id):
+    """Updates the status of an order (Admin only)."""
+    if order_id not in orders:
+        return jsonify({'message': 'Order not found'}), 404
+
+    data = request.get_json()
+    new_status = data.get('status')
+
+    if not new_status:
+        return jsonify({'message': 'New status is required'}), 400
+
+    valid_statuses = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled']
+    if new_status not in valid_statuses:
+        return jsonify({'message': f'Invalid status. Must be one of: {", ".join(valid_statuses)}'}), 400
+
+    orders[order_id]['status'] = new_status
+    return jsonify({'message': 'Order status updated successfully', 'order': orders[order_id]}), 200
+
+if __name__ == '__main__':
+    # Add some initial data for testing
+    # Admin user
+    admin_id = str(uuid.uuid4())
+    users[admin_id] = {
+        'username': 'admin',
+        'password_hash': generate_password_hash('adminpass'),
+        'role': 'admin'
+    }
+
+    # Customer user
+    customer_id = str(uuid.uuid4())
+    users[customer_id] = {
+        'username': 'customer',
+        'password_hash': generate_password_hash('customerpass'),
+        'role': 'customer'
+    }
+
+    # Sample products
+    product1_id = str(uuid.uuid4())
+    products[product1_id] = {
+        'name': 'Laptop Pro X',
+        'description': 'Powerful laptop for professionals.',
+        'price': 1200.00,
+        'stock': 10
+    }
+
+    product2_id = str(uuid.uuid4())
+    products[product2_id] = {
+        'name': 'Wireless Headphones',
+        'description': 'Noise-cancelling headphones with great sound.',
+        'price': 150.00,
+        'stock': 25
+    }
+
+    product3_id = str(uuid.uuid4())
+    products[product3_id] = {
+        'name': 'Mechanical Keyboard',
+        'description': 'RGB mechanical keyboard for gaming.',
+        'price': 80.00,
+        'stock': 15
+    }
+
+    app.run(host='0.0.0.0', port=5000, debug=True)
